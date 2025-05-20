@@ -66,9 +66,11 @@ def pre_tokenize(chunk: str, special_tokens: list[str]) -> tuple[list[list[bytes
             - list[list[bytes]]: a list of "words", where each "word" is a list of its constituent bytes.
                                  Special tokens are represented as a list containing a single bytes object.
     """
-    
+    special_tokens = sorted(special_tokens, key=lambda x: len(x), reverse=True)
     escaped_tokens = [re.escape(token) for token in special_tokens]
     delimiter_pattern = "|".join(escaped_tokens)
+    print("special_tokens: ", special_tokens)
+    print("delimiter_pattern:", delimiter_pattern)
 
     if delimiter_pattern:
         chunks = re.split(f"({delimiter_pattern})", chunk)
@@ -263,7 +265,7 @@ def train_bbpe(
 
     print(f"Initial vocab size: {len(vocab)}")
     print(f"Target vocab size: {vocab_size}")
-    print(f"vocab: {vocab}")
+    # print(f"vocab: {vocab}")
     print(f"Progress bar total: {vocab_size - len(vocab)}")
 
     pbar = tqdm(
@@ -302,7 +304,7 @@ def train_bbpe(
         if pair[0] in special_tokens_set or pair[1] in special_tokens_set:
             continue
         new_pair = pair[0] + pair[1]
-        print(f"merge pair: {pair}")
+        # print(f"merge pair: {pair}")
         all_tokens = merge_pair(pair, all_tokens, pair_freq, pair_pos)
         merges.append(pair)
         vocab[len(vocab)] = new_pair
@@ -312,7 +314,7 @@ def train_bbpe(
     print(f"Merge time: {end_time - start_time} seconds")
     
     pbar.close()
-    print(f"vocab: {vocab}")
-    print(f"merges: {merges}")
+    # print(f"vocab: {vocab}")
+    # print(f"merges: {merges}")
     return vocab, merges
     
