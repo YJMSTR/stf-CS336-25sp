@@ -61,4 +61,37 @@ class Embedding(nn.Module):
         """
         return self.weight[token_ids]
 
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
+        """
+        Construct the RMSNorm module. This function should accept the following parameters:
 
+        d_model: int Hidden dimension of the model
+        eps: float = 1e-5 Epsilon value for numerical stability
+        device: torch.device | None = None Device to store the parameters on
+        dtype: torch.dtype | None = None Data type of the parameters
+        """
+        super().__init__()
+
+        self.d_model = d_model
+        self.eps = eps
+        self.device = device
+        self.dtype = dtype
+
+        self.weight = nn.Parameter(torch.empty(d_model, device=device, dtype=dtype))
+        nn.init.ones_(self.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Process an input tensor of shape (batch_size, sequence_length, d_model) and return a tensor of the same shape
+        """
+        in_dtype = x.dtype
+        x = x.to(torch.float32)
+
+        x_square = x * x
+        mean_square = einops.reduce(x_square, "batch_size seq_len d_model -> batch_size seq_len 1", "mean")
+        mean_square = mean_square + self.eps
+        mean_square = mean_square ** 0.5
+        x = x / mean_square * self.weight
+        x = x.to(in_dtype)
+        return x
