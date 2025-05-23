@@ -95,3 +95,44 @@ class RMSNorm(nn.Module):
         x = x / mean_square * self.weight
         x = x.to(in_dtype)
         return x
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):
+        """
+        Construct the SwiGLU module. You should set dff to approximately 8/3 * dmodel in your implementation, while ensuring that
+        the dimensionality of the inner feed-forward layer is a multiple of 64 to make good use of your
+        hardware. This function should accept the following parameters:
+        
+        d_model: int Hidden dimension of the model
+        d_ff: int Dimension of the feed-forward layer
+        device: torch.device | None = None Device to store the parameters on
+        dtype: torch.dtype | None = None Data type of the parameters
+        """
+        super().__init__()
+        
+        self.d_model = d_model
+        self.d_ff = (d_ff + 63) // 64 * 64
+        self.device = device
+        self.dtype = dtype
+
+        self.w1 = Linear(self.d_model, self.d_ff, device=device, dtype=dtype)
+        self.w2 = Linear(self.d_ff, self.d_model, device=device, dtype=dtype)
+        self.w3 = Linear(self.d_model, self.d_ff, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply SwiGLU to the input
+        """
+
+        swish = self.w1.forward(x)
+        swish = swish * torch.sigmoid(swish)
+        gate = self.w3.forward(x)
+        output = swish * gate
+        output = self.w2.forward(output)
+        return output
+
+
+
+
+    
+        
