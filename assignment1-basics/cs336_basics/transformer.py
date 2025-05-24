@@ -170,8 +170,8 @@ class RotatyPositionalEmbedding(nn.Module):
         the sequence dimension.
         """
 
-        _, seq_len, d_k = x.shape
-        assert d_k == self.d_k, "d_k must be equal to the d_k of the RoPE module"
+        seq_len, d_k = x.shape[-2:]
+        assert d_k == self.d_k, f"d_k must be equal to the d_k of the RoPE module, got {d_k} and {self.d_k}"
         assert d_k % 2 == 0, "d_k must be even"
 
         x_pairs = einops.rearrange(x, "... seq_len (pairs two) -> ... seq_len pairs two", two = 2)
@@ -231,4 +231,76 @@ def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tens
 
     return einops.einsum(softmax, V, "... seq_len_q seq_len_k, ... seq_len_k d_v -> ... seq_len_q d_v")
 
+class MultiheadSelfAttention(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, theta: float | None = None, max_seq_len: int | None = None, token_positions: torch.Tensor | None = None, device=None, dtype=None):
+        """
+        Casual Multihead Self-Attention module.
+
+        d_model: int Hidden dimension of the model
+        num_heads: int Number of attention heads
+        theta: float | None = None RoPE parameter
+        max_seq_len: int | None = None Maximum sequence length for RoPE
+        token_positions: torch.Tensor | None = None Token positions for RoPE
+        device: torch.device | None = None Device to store the parameters on
+        dtype: torch.dtype | None = None Data type of the parameters
+
+        As a stretch goal, try combining the key, query, and value projections 
+        into a single weight matrix so you only need a single matrix multiply.
+        """
+        super().__init__()
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.device = device
+        self.dtype = dtype
+        self.theta = theta
+        self.max_seq_len = max_seq_len
+        self.token_positions = token_positions
+        self.d_k = self.d_v = d_model // num_heads
+
+        if theta is not None:
+            self.rope = RotatyPositionalEmbedding(theta, self.d_k, max_seq_len, device=device)
+        else:
+            self.rope = None
+
+        self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.o_proj = Linear(d_model, d_model, device=device, dtype=dtype)
     
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        Q = self.q_proj(x)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
+
+        Q = self.split_heads(Q)
+        K = self.split_heads(K)
+        V = self.split_heads(V)
+        # Apply RoPE to Q and K for each head
+        if self.theta is not None:
+            assert self.token_positions is not None, "token_positions must be provided if theta is not None"
+            Q = self.rope.forward(Q, self.token_positions)
+            K = self.rope.forward(K, self.token_positions)
+
+        self_mask = torch.triu(torch.ones(Q.shape[0], Q.shape[2], K.shape[2], device=Q.device), diagonal=1).bool()
+        self_mask = ~self_mask
+        # print(self_mask)
+
+        attention = scaled_dot_product_attention(Q, K, V, self_mask)
+
+        attention = self.merge_heads(attention)
+
+        return self.o_proj(attention)
+
+    def split_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Split the last dimension of the tensor into num_heads different dimensions.
+        """
+        return einops.rearrange(x, "batch_size seq_len (heads d_k) -> batch_size heads seq_len d_k", heads = self.num_heads)
+    
+    def merge_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Merge the last dimension of the tensor into num_heads different dimensions.
+        """
+        return einops.rearrange(x, "batch_size heads seq_len d_k -> batch_size seq_len (heads d_k)")
+        
