@@ -199,3 +199,36 @@ def softmax_numerically_stable(x: torch.Tensor, dim: int) -> torch.Tensor:
     x_sum = torch.sum(x_exp, dim=dim, keepdim=True)
     return x_exp / x_sum
 
+def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor | None = None):
+    """
+    Implement the scaled dot-product attention function. Your implementation should
+    handle keys and queries of shape (batch_size, ..., seq_len, d_k) and values of shape
+    (batch_size, ..., seq_len, d_v), where ... represents any number of other batch-like
+    dimensions (if provided). The implementation should return an output with the shape (batch_size,
+    ..., d_v). See section 3.3 for a discussion on batch-like dimensions.
+    Your implementation should also support an optional user-provided boolean mask of shape (seq_len,
+    seq_len). The attention probabilities of positions with a mask value of True should collectively sum
+    to 1, and the attention probabilities of positions with a mask value of False should be zero.
+    """
+    batch_size = Q.shape[0]
+    seq_len, d_k = Q.shape[-2:]
+    d_v = V.shape[-1]
+
+    assert Q.shape[-1] == K.shape[-1], "d_k must be the same for Q and K"
+    assert K.shape[-2] == V.shape[-2], "seq_len must be the same for K and V"
+
+    pre_softmax = einops.einsum(Q, K, "... seq_len_q d_k, ... seq_len_k d_k -> ... seq_len_q seq_len_k")
+
+    if mask is not None:
+        pre_softmax = pre_softmax.masked_fill(~mask, float("-inf"))
+
+    pre_softmax = pre_softmax / (d_k ** 0.5)
+
+    softmax = softmax_numerically_stable(pre_softmax, dim=-1)
+    # Verify that each column in softmax sums to 1
+    softmax_sum = torch.sum(softmax, dim=-1)
+    assert torch.allclose(softmax_sum, torch.ones_like(softmax_sum)), "Softmax probabilities do not sum to 1"
+
+    return einops.einsum(softmax, V, "... seq_len_q seq_len_k, ... seq_len_k d_v -> ... seq_len_q d_v")
+
+    
