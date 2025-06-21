@@ -6,7 +6,46 @@ from functools import partial
 from collections import Counter
 import time
 from tqdm import tqdm
-import heapq
+
+class Node:
+    def __init__(self, value):
+        self.value = value
+        self.next = None
+        self.prev = None
+    
+    def __repr__(self):
+        return f"Node(value={self.value}, next={self.next}, prev={self.prev})"
+    
+class DoublyLinkedList:
+    def __init__(self):
+        self.head = None
+        self.tail = None
+
+    def append(self, value):
+        new_node = Node(value)
+        if self.head is None:
+            self.head = new_node
+            self.tail = new_node
+        else:
+            self.tail.next = new_node
+            new_node.prev = self.tail
+            self.tail = new_node
+    def __repr__(self):
+        nodes = []
+        cur = self.head
+        while cur:
+            nodes.append(cur.value)
+            cur = cur.next
+        nodes.append(None)
+        return " -> ".join(str(node) for node in nodes)
+    
+    @staticmethod
+    def from_list(values: list[int]) -> "DoublyLinkedList":
+        dll = DoublyLinkedList()
+        for value in values:
+            dll.append(value)
+        return dll
+    
 
 def find_chunk_boundaries(
     file: BinaryIO, 
@@ -46,7 +85,7 @@ def find_chunk_boundaries(
 
     return sorted(set(chunk_boundaries))
 
-def pre_tokenize(chunk: str, special_tokens: list[str]) -> tuple[list[list[int]], dict[int, bytes]]:
+def pre_tokenize(chunk: str, special_tokens: list[str]) -> tuple[list[DoublyLinkedList], dict[int, bytes]]:
     vocab = {i: bytes([i]) for i in range(256)}
     byte_to_token_id = {v: k for k, v in vocab.items()}
 
@@ -71,116 +110,102 @@ def pre_tokenize(chunk: str, special_tokens: list[str]) -> tuple[list[list[int]]
 
     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
-    processed_tokens_as_list_of_ids = []
+    processed_tokens_as_dll_list = []
     for sub_chunk in chunks:
         sub_chunk_bytes = sub_chunk.encode('utf-8')
         if sub_chunk_bytes in special_tokens_set:
             token_id = byte_to_token_id[sub_chunk_bytes]
-            processed_tokens_as_list_of_ids.append([token_id])
+            dll = DoublyLinkedList.from_list([token_id])
+            processed_tokens_as_dll_list.append(dll)
         else:
             words_from_pat = [match.group() for match in re.finditer(PAT, sub_chunk)]
             for word_str in words_from_pat:
                 byte_sequence = word_str.encode('utf-8')
                 id_sequence = [b for b in byte_sequence]
-                processed_tokens_as_list_of_ids.append(id_sequence)
+                dll = DoublyLinkedList.from_list(id_sequence)
+                processed_tokens_as_dll_list.append(dll)
 
-    return processed_tokens_as_list_of_ids, vocab
+    return processed_tokens_as_dll_list, vocab
 
-def cal_freq(all_tokens: list[list[int]], special_token_ids: set[int]) -> tuple[Counter[tuple[int, int]], dict[tuple[int, int], set[int]]]:
+def cal_freq(all_tokens_as_dll: list[DoublyLinkedList], special_token_ids: set[int]) -> tuple[Counter[tuple[int, int]], dict[tuple[int, int], set[Node]]]:
     pair_freq = Counter()
-    pair_pos = {}
+    pair_pos: dict[tuple[int, int], set[Node]] = {}
 
-    for i, token_id_sequence in enumerate(all_tokens):
-        if len(token_id_sequence) == 1 and token_id_sequence[0] in special_token_ids:
+    for dll in all_tokens_as_dll:
+        # Skip if it's a special token (linked list has only one node and it's a special token)
+        if dll.head and dll.head.next is None and dll.head.value in special_token_ids:
             continue
 
-        for j in range(len(token_id_sequence) - 1):
-            pair = (token_id_sequence[j], token_id_sequence[j+1])
+        current_node = dll.head
+        while current_node and current_node.next:
+            pair = (current_node.value, current_node.next.value)
             pair_freq[pair] += 1
             if pair not in pair_pos:
                 pair_pos[pair] = set()
             
-            packed_pos = (i << 32) | j
-            pair_pos[pair].add(packed_pos)
+            # 关键: 存储对Node对象的直接引用
+            pair_pos[pair].add(current_node)
+            
+            current_node = current_node.next
             
     return pair_freq, pair_pos
 
-class HeapItem:
-    vocab: dict[int, bytes] = {}
-
-    def __init__(self, freq: int, pair: tuple[int, int]):
-        self.freq = freq
-        self.pair = pair
-
-    def __lt__(self, other: "HeapItem") -> bool:
-        if self.freq != other.freq:
-            return self.freq > other.freq
-        
-        p1_bytes = (HeapItem.vocab[self.pair[0]], HeapItem.vocab[self.pair[1]])
-        p2_bytes = (HeapItem.vocab[other.pair[0]], HeapItem.vocab[other.pair[1]])
-        return p1_bytes > p2_bytes
-
-    def __repr__(self):
-        return f"HeapItem(freq={self.freq}, pair={self.pair})"
 
 def merge_pair(
     best_pair: tuple[int, int],
-    all_tokens: list[list[int]],
-    pair_freq: Counter[tuple[int, int]],
-    pair_pos: dict[tuple[int, int], set[int]],
-    pq: list,
+    pair_freq: Counter,
+    pair_pos: dict,
     merged_token_id: int,
-) -> None:
-    affected_pair_types = set()
+):
+    nodes_to_merge = list(pair_pos[best_pair])
 
-    indices_of_words_to_update = set(pos >> 32 for pos in pair_pos[best_pair])
-
-    for i in indices_of_words_to_update:
-        token_id_sequence = all_tokens[i]
-
-        for j in range(len(token_id_sequence) - 1):
-            pair = (token_id_sequence[j], token_id_sequence[j+1])
-            if pair in pair_freq:
-                pair_freq[pair] -= 1
-                packed_pos = (i << 32) | j
-                pair_pos[pair].remove(packed_pos)
-                if pair_freq[pair] == 0:
-                    del pair_freq[pair]
-                    del pair_pos[pair]
-                affected_pair_types.add(pair)
-
-        new_token_id_sequence = []
-        j = 0
-        while j < len(token_id_sequence):
-            if j < len(token_id_sequence) - 1 and (token_id_sequence[j], token_id_sequence[j+1]) == best_pair:
-                new_token_id_sequence.append(merged_token_id)
-                j += 2
-            else:
-                new_token_id_sequence.append(token_id_sequence[j])
-                j += 1
+    for node1 in nodes_to_merge:
+        node2 = node1.next
         
-        all_tokens[i] = new_token_id_sequence
+        if not (node1.value == best_pair[0] and node2 and node2.value == best_pair[1]):
+            continue
 
-        for j in range(len(new_token_id_sequence) - 1):
-            pair = (new_token_id_sequence[j], new_token_id_sequence[j+1])
-            if pair not in pair_pos:
-                pair_pos[pair] = set()
-            
-            packed_pos = (i << 32) | j
-            pair_pos[pair].add(packed_pos)
-            pair_freq[pair] = pair_freq.get(pair, 0) + 1
-            affected_pair_types.add(pair)
-             
-    if best_pair in pair_freq:
-        del pair_freq[best_pair]
-    if best_pair in pair_pos:
-        del pair_pos[best_pair]
-    if best_pair in affected_pair_types:
-        affected_pair_types.remove(best_pair)
+        prev_node = node1.prev
+        if prev_node:
+            left_pair = (prev_node.value, node1.value)
+            pair_freq[left_pair] -= 1
+            if left_pair in pair_pos:
+                pair_pos[left_pair].discard(prev_node)
 
-    for pair in affected_pair_types:
-        if pair in pair_freq:
-            heapq.heappush(pq, HeapItem(pair_freq[pair], pair))
+        next_node = node2.next
+        if next_node:
+            right_pair = (node2.value, next_node.value)
+            pair_freq[right_pair] -= 1
+            if right_pair in pair_pos:
+                pair_pos[right_pair].discard(node2)
+
+        merged_node = Node(merged_token_id)
+        merged_node.prev = prev_node
+        merged_node.next = next_node
+        
+        if prev_node:
+            prev_node.next = merged_node
+
+        if next_node:
+            next_node.prev = merged_node
+
+        if prev_node:
+            new_left_pair = (prev_node.value, merged_node.value)
+            pair_freq[new_left_pair] = pair_freq.get(new_left_pair, 0) + 1
+            if new_left_pair not in pair_pos:
+                pair_pos[new_left_pair] = set()
+            pair_pos[new_left_pair].add(prev_node)
+
+        if next_node:
+            new_right_pair = (merged_node.value, next_node.value)
+            pair_freq[new_right_pair] = pair_freq.get(new_right_pair, 0) + 1
+            if new_right_pair not in pair_pos:
+                pair_pos[new_right_pair] = set()
+            pair_pos[new_right_pair].add(merged_node)
+
+    del pair_freq[best_pair]
+    del pair_pos[best_pair]
+
 
 def train_bbpe(
     input_path: str | os.PathLike,
@@ -204,7 +229,7 @@ def train_bbpe(
         end_time = time.time()
         print(f"Pre-tokenization time: {end_time - start_time} seconds")
 
-    all_tokens = []
+    all_tokens: list[DoublyLinkedList] = []
     if not results:
         return {}, []
 
@@ -236,27 +261,15 @@ def train_bbpe(
     end_time = time.time()
     print(f"Frequency calculation time: {end_time - start_time} seconds")
 
-    HeapItem.vocab = vocab
-
-    pq = []
-    for pair, freq in pair_freq.items():
-        heapq.heappush(pq, HeapItem(freq, pair))
-
     start_time = time.time()
 
     while len(vocab) < vocab_size:
-        if not pq:
+        if not pair_freq:
             break
-        top_item = None
-        while pq:
-            candidate = heapq.heappop(pq)
-            if candidate.pair in pair_freq and pair_freq[candidate.pair] == candidate.freq:
-                top_item = candidate
-                break
-        if top_item is None:
-            break
-
-        pair = top_item.pair
+        
+        max_freq = max(pair_freq.values())
+        candidate_pairs = [p for p, f in pair_freq.items() if f == max_freq]
+        pair = max(candidate_pairs, key=lambda p: (vocab[p[0]], vocab[p[1]]))
         
         new_token_id = len(vocab)
         
@@ -264,7 +277,7 @@ def train_bbpe(
         merges.append((vocab[pair[0]], vocab[pair[1]]))
         vocab[new_token_id] = merged_token_bytes
         
-        merge_pair(pair, all_tokens, pair_freq, pair_pos, pq, new_token_id)
+        merge_pair(pair, pair_freq, pair_pos, new_token_id)
 
         pbar.update(1)
 
