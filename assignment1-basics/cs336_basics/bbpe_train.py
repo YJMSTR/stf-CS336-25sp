@@ -234,7 +234,7 @@ def train_bbpe(
                 return self.freq > other.freq
             return self.byte_pair > other.byte_pair
 
-    pair_to_nodes = defaultdict(list)
+    pair_to_nodes = defaultdict(set)
     for word_tuple, count in all_word_freqs.items():
         if len(word_tuple) < 2:
             continue
@@ -249,7 +249,7 @@ def train_bbpe(
             current_node.prev = prev_node
             
             pair = (prev_node.value, current_node.value)
-            pair_to_nodes[pair].append(prev_node)
+            pair_to_nodes[pair].add(prev_node)
             prev_node = current_node
 
     pair_freqs = Counter()
@@ -287,9 +287,11 @@ def train_bbpe(
         merged_token_bytes = vocab[p1] + vocab[p2]
         merges.append((vocab[p1], vocab[p2]))
         vocab[new_token_id] = merged_token_bytes
-
-        for node1 in pair_to_nodes[best_pair]:
+        nodes_to_process = list(pair_to_nodes[best_pair])
+        for node1 in nodes_to_process:
             node2 = node1.next
+            if node2 is None:
+                continue
             word_freq = node1.word_freq['count']
 
             if node1.prev:
@@ -298,9 +300,9 @@ def train_bbpe(
                 pair_freqs[old_left_pair] -= word_freq
                 heapq.heappush(pq, pq_item(pair_freqs[old_left_pair], old_left_pair, (vocab[old_left_pair[0]], vocab[old_left_pair[1]])))
                 
-                pair_to_nodes[old_left_pair].remove(left_node)
+                pair_to_nodes[old_left_pair].discard(left_node)
                 new_left_pair = (left_node.value, new_token_id)
-                pair_to_nodes[new_left_pair].append(left_node)
+                pair_to_nodes[new_left_pair].add(left_node)
                 pair_freqs[new_left_pair] += word_freq
                 heapq.heappush(pq, pq_item(pair_freqs[new_left_pair], new_left_pair, (vocab[new_left_pair[0]], vocab[new_left_pair[1]])))
 
@@ -311,8 +313,8 @@ def train_bbpe(
                 heapq.heappush(pq, pq_item(pair_freqs[old_right_pair], old_right_pair, (vocab[old_right_pair[0]], vocab[old_right_pair[1]])))
                 
                 new_right_pair = (new_token_id, right_node.value)
-                pair_to_nodes[old_right_pair].remove(node2)
-                pair_to_nodes[new_right_pair].append(node1)
+                pair_to_nodes[old_right_pair].discard(node2)
+                pair_to_nodes[new_right_pair].add(node1)
                 pair_freqs[new_right_pair] += word_freq
                 heapq.heappush(pq, pq_item(pair_freqs[new_right_pair], new_right_pair, (vocab[new_right_pair[0]], vocab[new_right_pair[1]])))
 
