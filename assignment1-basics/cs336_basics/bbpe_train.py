@@ -112,10 +112,8 @@ def pre_tokenize_and_count(
             token_id = special_token_to_id[sub_chunk]
             words_list.append((token_id,))
         else:
-            # For non-special tokens, apply the standard GPT-2 pre-tokenization regex.
             for word_str in PAT_COMPILED.findall(sub_chunk):
                 if word_str:
-                    # Encode the resulting word strings to their byte representations.
                     byte_sequence = word_str.encode("utf-8")
                     id_sequence = tuple(byte_sequence)
                     words_list.append(id_sequence)
