@@ -3,9 +3,10 @@ import regex as re
 from typing import BinaryIO
 from multiprocessing import Pool, cpu_count
 from functools import partial
-from collections import Counter
+from collections import Counter, defaultdict
 import time
 from tqdm import tqdm
+import heapq
 
 PAT_COMPILED = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
@@ -57,63 +58,83 @@ def get_pair_stats(word_freqs: dict[tuple[int, ...], int]) -> Counter[tuple[int,
             pair_freqs[pair] += freq
     return pair_freqs
 
-def pre_tokenize(
-    args: tuple[str, dict[bytes, int], list[str], re.Pattern]
-) -> list[tuple[int, ...]]:
-    chunk, byte_to_token_id, special_tokens, delimiter_pattern_compiled = args
+# def pre_tokenize(
+#     args: tuple[str, dict[bytes, int], list[str], re.Pattern]
+# ) -> list[tuple[int, ...]]:
+#     chunk, byte_to_token_id, special_tokens, delimiter_pattern_compiled = args
     
-    special_tokens_bytes = {token.encode("utf-8") for token in special_tokens}
+#     special_tokens_bytes = {token.encode("utf-8") for token in special_tokens}
+    
+#     words_list = []
+    
+#     if delimiter_pattern_compiled:
+#         chunks = delimiter_pattern_compiled.split(chunk)
+#     else:
+#         chunks = [chunk]
+
+#     for sub_chunk in chunks:
+#         if not sub_chunk:
+#             continue
+            
+#         sub_chunk_bytes = sub_chunk.encode("utf-8")
+#         if sub_chunk_bytes in special_tokens_bytes:
+#             token_id = byte_to_token_id[sub_chunk_bytes]
+#             words_list.append((token_id,))
+#         else:
+#             words = PAT_COMPILED.findall(sub_chunk)
+#             for word_str in words:
+#                 if word_str:
+#                     byte_sequence = word_str.encode("utf-8")
+#                     id_sequence = tuple(byte_sequence)
+#                     words_list.append(id_sequence)
+
+#     return words_list
+
+def pre_tokenize_and_count(
+    args: tuple[bytes, dict[str, int], re.Pattern]
+) -> Counter:
+    chunk_bytes, special_token_to_id, delimiter_pattern_compiled = args
+    chunk = chunk_bytes.decode("utf-8", errors="ignore")
+    special_tokens_set = set(special_token_to_id.keys())
     
     words_list = []
     
     if delimiter_pattern_compiled:
-        chunks = delimiter_pattern_compiled.split(chunk)
+        sub_chunks = delimiter_pattern_compiled.split(chunk)
     else:
-        chunks = [chunk]
+        sub_chunks = [chunk]
 
-    for sub_chunk in chunks:
+    for sub_chunk in sub_chunks:
         if not sub_chunk:
             continue
             
-        sub_chunk_bytes = sub_chunk.encode("utf-8")
-        if sub_chunk_bytes in special_tokens_bytes:
-            token_id = byte_to_token_id[sub_chunk_bytes]
+        if sub_chunk in special_tokens_set:
+            token_id = special_token_to_id[sub_chunk]
             words_list.append((token_id,))
         else:
-            words = PAT_COMPILED.findall(sub_chunk)
-            for word_str in words:
+            # For non-special tokens, apply the standard GPT-2 pre-tokenization regex.
+            for word_str in PAT_COMPILED.findall(sub_chunk):
                 if word_str:
+                    # Encode the resulting word strings to their byte representations.
                     byte_sequence = word_str.encode("utf-8")
                     id_sequence = tuple(byte_sequence)
                     words_list.append(id_sequence)
 
-    return words_list
+    return Counter(words_list)
 
-def calculate_optimal_chunk_count(file_size_gb: float, base_chunks: int = None) -> int:
-    if base_chunks is None:
-        base_chunks = cpu_count()
-    
-    if file_size_gb > 1.0:
-        optimal_chunks = min(base_chunks * 4, int(file_size_gb * base_chunks * 2))
-    else:
-        optimal_chunks = base_chunks
-    
-    return max(optimal_chunks, 1)
+def merge_counters(c1: Counter, c2: Counter) -> Counter:
+    c1.update(c2)
+    return c1
 
 def train_bbpe(
     input_path: str | os.PathLike,
     vocab_size: int,
     special_tokens: list[str],
-    num_chunks: int = None,
+    num_chunks: int = 8,
+    num_processes: int = None,
     **kwargs,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    
-    if num_chunks is None:
-        file_size = os.path.getsize(input_path)
-        file_size_gb = file_size / (1024**3)
-        num_chunks = calculate_optimal_chunk_count(file_size_gb)
-        print(f"Auto-calculated optimal chunks: {num_chunks} for {file_size_gb:.2f}GB file")
-    
+    before_pretokenization_time = time.time()
     vocab = {i: bytes([i]) for i in range(256)}
     for token in special_tokens:
         token_bytes = token.encode("utf-8")
@@ -121,8 +142,13 @@ def train_bbpe(
             vocab[len(vocab)] = token_bytes
     byte_to_token_id = {v: k for k, v in vocab.items()}
     
+    special_token_to_id = {
+        token: byte_to_token_id[token.encode("utf-8")] for token in special_tokens
+    }
+
     delimiter_pattern_compiled = None
     if special_tokens:
+        # Sort by length descending to handle overlapping tokens correctly
         special_tokens_sorted = sorted(
             [t.encode("utf-8") for t in special_tokens], key=len, reverse=True
         )
@@ -142,38 +168,42 @@ def train_bbpe(
             chunk_bytes = f.read(end - start)
             chunk_args.append(
                 (
-                    chunk_bytes.decode("utf-8", errors="ignore"),
-                    byte_to_token_id,
-                    special_tokens,
+                    chunk_bytes,
+                    special_token_to_id,
                     delimiter_pattern_compiled,
                 )
             )
 
-    max_processes = min(cpu_count(), len(chunk_args))
+    processes_to_use = num_processes
+    if processes_to_use is None:
+        # Use a conservative default to prevent memory issues on machines with many cores.
+        processes_to_use = min(cpu_count(), 8)
     
-    with Pool(processes=max_processes) as pool:
-        start_time = time.time()
-        print(f"Starting pre-tokenization with {max_processes} processes on {len(chunk_args)} chunks...")
-        results = list(pool.map(pre_tokenize, chunk_args))
-        end_time = time.time()
-        print(f"Pre-tokenization time: {end_time - start_time:.2f} seconds")
+    processes_to_use = min(processes_to_use, len(chunk_args))
 
-    if not results:
-        return {}, []
-
-    print("Aggregating word frequencies...")
-    aggregation_start = time.time()
+    before_pretokenization_time = time.time() - before_pretokenization_time
+    print(f"Time taken before pretokenization: {before_pretokenization_time:.2f} seconds")
     
     all_word_freqs = Counter()
-    total_words_processed = 0
+    start_time = time.time()
+    with Pool(processes=processes_to_use) as pool:
+        print(f"Starting pre-tokenization with {processes_to_use} processes on {len(chunk_args)} chunks...")
+        
+        # Use imap_unordered for memory efficiency. It returns an iterator.
+        results_iterator = pool.imap_unordered(pre_tokenize_and_count, chunk_args)
+        
+        # Iterate through results as they complete and merge them one by one.
+        for chunk_counter in tqdm(results_iterator, total=len(chunk_args), desc="Processing chunks"):
+            all_word_freqs.update(chunk_counter)
+
+    end_time = time.time()
+    print(f"Pre-tokenization and initial counting time: {end_time - start_time:.2f} seconds")
+
+    if not all_word_freqs:
+        return {}, []
+
+    total_words_processed = sum(all_word_freqs.values())
     
-    for words_list in results:
-        if words_list:
-            all_word_freqs.update(words_list)
-            total_words_processed += len(words_list)
-    
-    aggregation_end = time.time()
-    print(f"Aggregation time: {aggregation_end - aggregation_start:.2f} seconds")
     print(f"Total words processed: {total_words_processed:,}")
     print(f"Unique word patterns: {len(all_word_freqs):,}")
 
@@ -183,71 +213,119 @@ def train_bbpe(
     print(f"Target vocab size: {vocab_size}")
 
     num_merges = vocab_size - len(vocab)
-    pbar = tqdm(
-        total=num_merges,
-        desc="Performing BPE merges"
-    )
+    if num_merges <= 0:
+        return vocab, merges
 
-    pair_freqs = get_pair_stats(all_word_freqs)
+    class Node:
+        def __init__(self, value, word_freq):
+            self.value = value
+            self.word_freq = word_freq
+            self.prev = None
+            self.next = None
+
+    class pq_item:
+        def __init__(self, freq, id_pair, byte_pair):
+            self.freq = freq
+            self.id_pair = id_pair
+            self.byte_pair = byte_pair 
+
+        def __lt__(self, other):
+            if self.freq != other.freq:
+                return self.freq > other.freq
+            return self.byte_pair > other.byte_pair
+
+    pair_to_nodes = defaultdict(list)
+    for word_tuple, count in all_word_freqs.items():
+        if len(word_tuple) < 2:
+            continue
+        
+        word_freq = {'count': count}
+        
+        head = Node(word_tuple[0], word_freq)
+        prev_node = head
+        for i in range(1, len(word_tuple)):
+            current_node = Node(word_tuple[i], word_freq)
+            prev_node.next = current_node
+            current_node.prev = prev_node
+            
+            pair = (prev_node.value, current_node.value)
+            pair_to_nodes[pair].append(prev_node)
+            prev_node = current_node
+
+    pair_freqs = Counter()
+    for pair, nodes in pair_to_nodes.items():
+        pair_freqs[pair] = sum(node.word_freq['count'] for node in nodes)
+        
+    pq = [
+        pq_item(freq, p, (vocab[p[0]], vocab[p[1]]))
+        for p, freq in pair_freqs.items()
+    ]
+    heapq.heapify(pq)
+
+    pbar = tqdm(total=num_merges, desc="Performing BPE merges")
     start_time = time.time()
 
     for _ in range(num_merges):
-        if not pair_freqs:
+        if not pq:
             break
+            
+        best_pair = None
+        while pq:
+            item = heapq.heappop(pq)
+            if item.id_pair not in pair_freqs:
+                continue
+            if pair_freqs[item.id_pair] == item.freq:
+                best_pair = item.id_pair
+                break
         
-        max_freq = max(pair_freqs.values())
-        candidate_pairs = [p for p, f in pair_freqs.items() if f == max_freq]
-        best_pair = max(candidate_pairs, key=lambda p: (vocab[p[0]], vocab[p[1]]))
+        if best_pair is None:
+            break
+
+        p1, p2 = best_pair
         
         new_token_id = len(vocab)
-        
-        merged_token_bytes = vocab[best_pair[0]] + vocab[best_pair[1]]
-        merges.append((vocab[best_pair[0]], vocab[best_pair[1]]))
+        merged_token_bytes = vocab[p1] + vocab[p2]
+        merges.append((vocab[p1], vocab[p2]))
         vocab[new_token_id] = merged_token_bytes
-        
-        p1, p2 = best_pair
-        newly_formed_word_freqs = Counter()
-        words_to_remove = []
 
-        for word, freq in all_word_freqs.items():
-            if len(word) < 2:
-                continue
-            
-            i = 0
-            new_word = []
-            merged = False
-            while i < len(word):
-                if i < len(word) - 1 and word[i] == p1 and word[i+1] == p2:
-                    new_word.append(new_token_id)
-                    merged = True
-                    i += 2
-                else:
-                    new_word.append(word[i])
-                    i += 1
+        for node1 in pair_to_nodes[best_pair]:
+            node2 = node1.next
+            word_freq = node1.word_freq['count']
 
-            if merged:
-                new_word_tuple = tuple(new_word)
-                newly_formed_word_freqs[new_word_tuple] += freq
-                words_to_remove.append(word)
+            if node1.prev:
+                left_node = node1.prev
+                old_left_pair = (left_node.value, node1.value)
+                pair_freqs[old_left_pair] -= word_freq
+                heapq.heappush(pq, pq_item(pair_freqs[old_left_pair], old_left_pair, (vocab[old_left_pair[0]], vocab[old_left_pair[1]])))
+                
+                pair_to_nodes[old_left_pair].remove(left_node)
+                new_left_pair = (left_node.value, new_token_id)
+                pair_to_nodes[new_left_pair].append(left_node)
+                pair_freqs[new_left_pair] += word_freq
+                heapq.heappush(pq, pq_item(pair_freqs[new_left_pair], new_left_pair, (vocab[new_left_pair[0]], vocab[new_left_pair[1]])))
 
-                for i in range(len(word) - 1):
-                    pair_freqs[(word[i], word[i+1])] -= freq
-        
-        for word in words_to_remove:
-            del all_word_freqs[word]
-        all_word_freqs.update(newly_formed_word_freqs)
+            if node2.next:
+                right_node = node2.next
+                old_right_pair = (node2.value, right_node.value)
+                pair_freqs[old_right_pair] -= word_freq
+                heapq.heappush(pq, pq_item(pair_freqs[old_right_pair], old_right_pair, (vocab[old_right_pair[0]], vocab[old_right_pair[1]])))
+                
+                new_right_pair = (new_token_id, right_node.value)
+                pair_to_nodes[old_right_pair].remove(node2)
+                pair_to_nodes[new_right_pair].append(node1)
+                pair_freqs[new_right_pair] += word_freq
+                heapq.heappush(pq, pq_item(pair_freqs[new_right_pair], new_right_pair, (vocab[new_right_pair[0]], vocab[new_right_pair[1]])))
 
-        for new_word, freq in newly_formed_word_freqs.items():
-            if len(new_word) < 2:
-                continue
-            for i in range(len(new_word) - 1):
-                pair_freqs[(new_word[i], new_word[i+1])] = pair_freqs.get((new_word[i], new_word[i+1]), 0) + freq
-        
-        if best_pair in pair_freqs:
-             del pair_freqs[best_pair]
+            node1.value = new_token_id
+            node1.next = node2.next
+            if node2.next:
+                node2.next.prev = node1
+
+        del pair_freqs[best_pair]
+        del pair_to_nodes[best_pair]
         
         pbar.update(1)
-
+    
     end_time = time.time()
     print(f"Merge time: {end_time - start_time:.2f} seconds")
     
