@@ -8,7 +8,7 @@ from collections import Counter
 import time
 from tqdm import tqdm
 
-from cs336_basics.bbpe_train import pre_tokenize, find_chunk_boundaries 
+from cs336_basics.bbpe_train import pre_tokenize_and_count, find_chunk_boundaries, PAT_COMPILED
 
 class BPE_Tokenizer:
     def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
@@ -24,12 +24,18 @@ class BPE_Tokenizer:
         self.merges = merges
         self.special_tokens = special_tokens
         self.token_to_id = {token: id for id, token in self.vocab.items()}
+        # if special tokens are provided, add them to the vocab and token_to_id
         if special_tokens:
             for special_token in special_tokens:
-                if special_token not in self.token_to_id:
-                    self.vocab[len(self.vocab)] = special_token.encode('utf-8')
-                    self.token_to_id[special_token] = len(self.vocab) - 1
-        
+                token_bytes = special_token.encode('utf-8')
+                if token_bytes not in self.token_to_id:
+                    new_id = len(self.vocab)
+                    self.vocab[new_id] = token_bytes
+                    self.token_to_id[token_bytes] = new_id
+
+        self.bpe_ranks: dict[tuple[bytes, bytes], int] = {
+            merge_pair: rank for rank, merge_pair in enumerate(self.merges)
+        }
 
     @classmethod
     def from_files(cls, vocab_filepath: str | os.PathLike, merges_filepath: str | os.PathLike, special_tokens=None):
@@ -48,40 +54,56 @@ class BPE_Tokenizer:
         """
         Encode an input text into a sequence of token IDs
         """
-        pre_tokenized = pre_tokenize(text, self.special_tokens or [])
-        token_ids = []
-        special_tokens_set = set(self.special_tokens or [])
+        if not hasattr(self, "_special_delim"):
+            if self.special_tokens:
+                special_sorted = sorted(self.special_tokens, key=len, reverse=True)
+                escaped = [re.escape(tok) for tok in special_sorted]
+                self._special_delim = re.compile(f"({'|'.join(escaped)})")
+            else:
+                self._special_delim = None
 
-        for merge in self.merges:
-            for i, word in enumerate(pre_tokenized):
-                word_str = b''.join(word).decode('utf-8')
-                if special_tokens_set and word_str in special_tokens_set:
-                    continue
-                new_word = []
-                j = 0
-                while j < len(word):
-                    if j+1 < len(word) and (word[j], word[j+1]) == merge:
-                        new_word.append(word[j] + word[j+1])
-                        j += 2
-                    else:
-                        new_word.append(word[j])
-                        j += 1
-                pre_tokenized[i] = new_word
-        
-        for word in pre_tokenized:
-            word_str = b''.join(word).decode('utf-8')
-            if special_tokens_set and word_str in special_tokens_set:
-                token_ids.append(self.token_to_id[word_str.encode('utf-8')])
-                print(f"Special token appended: {word_str}, ID: {self.token_to_id[word_str.encode('utf-8')]}")
+        special_set = set(self.special_tokens or [])
+
+        chunks = self._special_delim.split(text) if self._special_delim else [text]
+
+        def apply_bpe(tokens: list[bytes]) -> list[bytes]:
+            """Apply BPE merges inside a single word (list of byte tokens)."""
+            if len(tokens) < 2:
+                return tokens
+            while True:
+                best_rank = None
+                best_idx = -1
+                for i in range(len(tokens) - 1):
+                    rank = self.bpe_ranks.get((tokens[i], tokens[i + 1]))
+                    if rank is not None and (best_rank is None or rank < best_rank):
+                        best_rank = rank
+                        best_idx = i
+                if best_rank is None:
+                    break
+                merged = tokens[best_idx] + tokens[best_idx + 1]
+                tokens[best_idx : best_idx + 2] = [merged]
+            return tokens
+
+        output_ids: list[int] = []
+
+        for chunk in chunks:
+            if not chunk:
                 continue
-            for token in word:
-                if token in self.token_to_id:
-                    token_ids.append(self.token_to_id[token])
-                else:
-                    raise ValueError(f"Token {token} not found in vocabulary")
-        if len(token_ids) == 0:
-            return []
-        return token_ids
+            if chunk in special_set:
+                # Special token stays as single unit
+                token_bytes = chunk.encode("utf-8")
+                output_ids.append(self.token_to_id[token_bytes])
+                continue
+
+            for piece in PAT_COMPILED.findall(chunk):
+                if not piece:
+                    continue
+                byte_seq = piece.encode("utf-8")
+                word_tokens = [bytes([b]) for b in byte_seq]
+                merged_tokens = apply_bpe(word_tokens)
+                output_ids.extend(self.token_to_id[t] for t in merged_tokens)
+
+        return output_ids
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
         """
