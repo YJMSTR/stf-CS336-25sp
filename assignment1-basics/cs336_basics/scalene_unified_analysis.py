@@ -16,7 +16,8 @@ def unified_performance_analysis():
         "input_path": "../data/TinyStoriesV2-GPT4-train.txt",
         "vocab_size": 10000,
         "special_tokens": ["<|endoftext|>"],
-        "num_chunks": 32,
+        "num_chunks": 16,
+        "num_processes": 8,
     }
     
     print(f"test params:")
