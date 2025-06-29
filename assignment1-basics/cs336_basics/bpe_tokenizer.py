@@ -8,7 +8,7 @@ from collections import Counter
 import time
 from tqdm import tqdm
 
-from cs336_basics.bbpe_train import pre_tokenize_and_count, find_chunk_boundaries, PAT_COMPILED
+from .bbpe_train import PAT_COMPILED
 
 class BPE_Tokenizer:
     def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
