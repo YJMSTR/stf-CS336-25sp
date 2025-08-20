@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import einops
+import numpy as np
 
 class Linear(nn.Module):
     def __init__(self, in_features, out_features,  device=None, dtype=None):
@@ -557,4 +558,86 @@ def gradient_clipping(parameters, max_l2_norm: float) -> None:
         clip_coef = max_l2_norm / (total_norm + eps)
         for grad in grads:
             grad.data.mul_(clip_coef)
+
+
+def get_batch(dataset: np.ndarray, batch_size: int, context_length: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Given a dataset (a 1D numpy array of integers) and a desired batch size and
+    context length, sample language modeling input sequences and their corresponding
+    labels from the dataset.
+
+    Args:
+        dataset (np.array): 1D numpy array of integer token IDs in the dataset.
+                           Can be a regular numpy array or memory-mapped array (np.memmap).
+        batch_size (int): Desired batch size to sample.
+        context_length (int): Desired context length of each sampled example.
+        device (str): PyTorch device string (e.g., 'cpu' or 'cuda:0') indicating the device
+            to place the sampled input sequences and labels on.
+
+    Returns:
+        Tuple of torch.LongTensors of shape (batch_size, context_length). The first tuple item
+        is the sampled input sequences, and the second tuple item is the corresponding
+        language modeling labels.
+    """
+    # Calculate the maximum starting index we can use
+    # We need context_length tokens for input and 1 more for the target
+    max_start_idx = len(dataset) - context_length
+    
+    # Sample random starting indices for each batch item
+    start_indices = np.random.randint(0, max_start_idx, size=batch_size)
+    
+    # Create input sequences
+    input_sequences = np.zeros((batch_size, context_length), dtype=np.int64)
+    target_sequences = np.zeros((batch_size, context_length), dtype=np.int64)
+    
+    for i in range(batch_size):
+        start_idx = start_indices[i]
+        # Input sequence: x[start_idx:start_idx+context_length]
+        input_sequences[i] = dataset[start_idx:start_idx + context_length]
+        # Target sequence: x[start_idx+1:start_idx+context_length+1]  
+        target_sequences[i] = dataset[start_idx + 1:start_idx + context_length + 1]
+    
+    # Convert to PyTorch tensors and move to the specified device
+    input_tensor = torch.from_numpy(input_sequences).to(device)
+    target_tensor = torch.from_numpy(target_sequences).to(device)
+    
+    return input_tensor, target_tensor
+
+
+def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, iteration: int, out) -> None:
+    """
+    Save model state, optimizer state, and iteration number to a checkpoint file.
+    
+    Args:
+        model: torch.nn.Module to save
+        optimizer: torch.optim.Optimizer to save  
+        iteration: int iteration number to save
+        out: str | os.PathLike | typing.BinaryIO | typing.IO[bytes] output file path or file-like object
+    """
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'iteration': iteration
+    }
+    torch.save(checkpoint, out)
+
+
+def load_checkpoint(src, model: nn.Module, optimizer: torch.optim.Optimizer) -> int:
+    """
+    Load checkpoint from file and restore model and optimizer states.
+    
+    Args:
+        src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes] source file path or file-like object
+        model: torch.nn.Module to restore state to
+        optimizer: torch.optim.Optimizer to restore state to
         
+    Returns:
+        int: iteration number from the checkpoint
+    """
+    checkpoint = torch.load(src)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    return checkpoint['iteration']
+
+
+
