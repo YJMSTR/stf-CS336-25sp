@@ -10,7 +10,7 @@ import torch
 from torch import Tensor
 from cs336_basics.bbpe_train import train_bbpe
 from cs336_basics.bpe_tokenizer import BPE_Tokenizer
-from cs336_basics.transformer import Linear, Embedding, MultiheadSelfAttention, RMSNorm, SwiGLU, RotatyPositionalEmbedding, scaled_dot_product_attention, softmax_numerically_stable
+from cs336_basics.transformer import Linear, Embedding, MultiheadSelfAttention, RMSNorm, SwiGLU, RotatyPositionalEmbedding, scaled_dot_product_attention, softmax_numerically_stable, TransformerBlock, TransformerLM
 
 def run_linear(
     d_in: int,
@@ -294,7 +294,31 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    # Generate token positions for the sequence
+    batch_size, seq_len = in_features.shape[0], in_features.shape[1]
+    token_positions = torch.arange(seq_len, device=in_features.device).unsqueeze(0).expand(batch_size, -1)
+    
+    # Create the transformer block
+    transformer_block = TransformerBlock(d_model, num_heads, d_ff, theta, max_seq_len)
+    
+    # Set the weights manually
+    # RMSNorm weights for both sublayers
+    transformer_block.ln1.weight.data = weights["ln1.weight"]
+    transformer_block.ln2.weight.data = weights["ln2.weight"]
+    
+    # Set attention weights
+    transformer_block.attn.q_proj.weight.data = weights["attn.q_proj.weight"]
+    transformer_block.attn.k_proj.weight.data = weights["attn.k_proj.weight"]
+    transformer_block.attn.v_proj.weight.data = weights["attn.v_proj.weight"]
+    transformer_block.attn.o_proj.weight.data = weights["attn.output_proj.weight"]
+    
+    # Set FFN weights
+    transformer_block.ffn.w1.weight.data = weights["ffn.w1.weight"]
+    transformer_block.ffn.w2.weight.data = weights["ffn.w2.weight"]
+    transformer_block.ffn.w3.weight.data = weights["ffn.w3.weight"]
+    
+    # Forward pass
+    return transformer_block(in_features, token_positions)
 
 
 def run_transformer_lm(
@@ -321,7 +345,7 @@ def run_transformer_lm(
         num_heads (int): Number of heads to use in multi-headed attention. `d_model` must be
             evenly divisible by `num_heads`.
         d_ff (int): Dimensionality of the feed-forward inner layer (section 3.3).
-        rope_theta (float): The RoPE $\Theta$ parameter.
+        rope_theta (float): The RoPE $\\Theta$ parameter.
         weights (dict[str, Tensor]): 
             State dict of our reference implementation. {num_layers} refers to an
             integer between `0` and `num_layers - 1` (the layer index).
@@ -376,7 +400,45 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    # Create the transformer language model
+    model = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta
+    )
+    
+    # Set token embeddings
+    model.token_embeddings.weight.data = weights["token_embeddings.weight"]
+    
+    # Set weights for each layer
+    for layer_idx in range(num_layers):
+        layer = model.layers[layer_idx]
+        
+        # Set attention weights
+        layer.attn.q_proj.weight.data = weights[f"layers.{layer_idx}.attn.q_proj.weight"]
+        layer.attn.k_proj.weight.data = weights[f"layers.{layer_idx}.attn.k_proj.weight"]
+        layer.attn.v_proj.weight.data = weights[f"layers.{layer_idx}.attn.v_proj.weight"]
+        layer.attn.o_proj.weight.data = weights[f"layers.{layer_idx}.attn.output_proj.weight"]
+        
+        # Set layer norm weights
+        layer.ln1.weight.data = weights[f"layers.{layer_idx}.ln1.weight"]
+        layer.ln2.weight.data = weights[f"layers.{layer_idx}.ln2.weight"]
+        
+        # Set FFN weights
+        layer.ffn.w1.weight.data = weights[f"layers.{layer_idx}.ffn.w1.weight"]
+        layer.ffn.w2.weight.data = weights[f"layers.{layer_idx}.ffn.w2.weight"]
+        layer.ffn.w3.weight.data = weights[f"layers.{layer_idx}.ffn.w3.weight"]
+    
+    # Set final layer norm and language modeling head weights
+    model.ln_final.weight.data = weights["ln_final.weight"]
+    model.lm_head.weight.data = weights["lm_head.weight"]
+    
+    # Forward pass
+    return model(in_indices)
 
 
 def run_rmsnorm(

@@ -303,4 +303,156 @@ class MultiheadSelfAttention(nn.Module):
         Merge the last dimension of the tensor into num_heads different dimensions.
         """
         return einops.rearrange(x, "batch_size heads seq_len d_k -> batch_size seq_len (heads d_k)")
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, theta: float, max_seq_len: int, device=None, dtype=None):
+        """
+        Pre-norm Transformer block with RoPE.
+        
+        d_model: int Hidden dimension of the model
+        num_heads: int Number of attention heads  
+        d_ff: int Dimension of the feed-forward layer
+        theta: float RoPE parameter
+        max_seq_len: int Maximum sequence length for RoPE
+        device: torch.device | None = None Device to store the parameters on
+        dtype: torch.dtype | None = None Data type of the parameters
+        """
+        super().__init__()
+        
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.theta = theta
+        self.max_seq_len = max_seq_len
+        self.device = device
+        self.dtype = dtype
+        
+        # Pre-norm layers for both sublayers
+        self.ln1 = RMSNorm(d_model, device=device, dtype=dtype)
+        self.ln2 = RMSNorm(d_model, device=device, dtype=dtype)
+        
+        # Multi-head self-attention with RoPE 
+        # Initialize with dummy token_positions, will be updated in forward
+        dummy_positions = torch.zeros((1, max_seq_len), dtype=torch.long)
+        self.attn = MultiheadSelfAttention(
+            d_model, num_heads, theta, max_seq_len, 
+            dummy_positions, device, dtype
+        )
+        
+        # Feed-forward network (SwiGLU)
+        self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
+        
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Forward pass of the transformer block implementing both sublayers:
+        
+        First sublayer: y = x + MultiHeadSelfAttention(RMSNorm(x))
+        Second sublayer: z = y + FFN(RMSNorm(y))
+        
+        x: torch.Tensor of shape (batch_size, sequence_length, d_model)
+        token_positions: torch.Tensor of shape (batch_size, sequence_length) with token positions for RoPE
+        
+        Returns: torch.Tensor of shape (batch_size, sequence_length, d_model)
+        """
+        # Generate default token positions if not provided
+        if token_positions is None:
+            batch_size, seq_len = x.shape[0], x.shape[1]
+            token_positions = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
+        
+        # Update attention's token positions
+        self.attn.token_positions = token_positions
+        
+        # First sublayer: y = x + MultiHeadSelfAttention(RMSNorm(x))
+        y = x + self.attn(self.ln1(x))
+        
+        # Second sublayer: z = y + FFN(RMSNorm(y))
+        z = y + self.ffn(self.ln2(y))
+        
+        return z
+
+
+class TransformerLM(nn.Module):
+    def __init__(
+        self, 
+        vocab_size: int, 
+        context_length: int, 
+        d_model: int, 
+        num_layers: int, 
+        num_heads: int, 
+        d_ff: int, 
+        rope_theta: float, 
+        device=None, 
+        dtype=None
+    ):
+        """
+        Transformer Language Model.
+        
+        Args:
+            vocab_size: int The size of the vocabulary
+            context_length: int The maximum context length  
+            d_model: int Hidden dimension of the model
+            num_layers: int The number of Transformer blocks
+            num_heads: int Number of attention heads
+            d_ff: int Dimension of the feed-forward layer
+            rope_theta: float RoPE parameter
+            device: torch.device | None = None Device to store the parameters on
+            dtype: torch.dtype | None = None Data type of the parameters
+        """
+        super().__init__()
+        
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.rope_theta = rope_theta
+        self.device = device
+        self.dtype = dtype
+        
+        # Token embeddings
+        self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
+        
+        # Transformer layers
+        self.layers = nn.ModuleList([
+            TransformerBlock(d_model, num_heads, d_ff, rope_theta, context_length, device=device, dtype=dtype)
+            for _ in range(num_layers)
+        ])
+        
+        # Final layer normalization
+        self.ln_final = RMSNorm(d_model, device=device, dtype=dtype)
+        
+        # Language modeling head
+        self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
+    
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the transformer language model.
+        
+        Args:
+            input_ids: torch.Tensor of shape (batch_size, sequence_length)
+        
+        Returns:
+            torch.Tensor of shape (batch_size, sequence_length, vocab_size)
+        """
+        batch_size, seq_len = input_ids.shape
+        
+        # Generate token positions for RoPE
+        token_positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+        
+        # Token embeddings
+        x = self.token_embeddings(input_ids)
+        
+        # Pass through transformer blocks
+        for layer in self.layers:
+            x = layer(x, token_positions)
+        
+        # Final layer normalization
+        x = self.ln_final(x)
+        
+        # Language modeling head
+        logits = self.lm_head(x)
+        
+        return logits
         
