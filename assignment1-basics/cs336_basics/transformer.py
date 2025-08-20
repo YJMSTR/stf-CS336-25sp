@@ -455,4 +455,106 @@ class TransformerLM(nn.Module):
         logits = self.lm_head(x)
         
         return logits
+
+def cross_entropy(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    Compute the cross-entropy loss between inputs and targets in a numerically stable way.
+    
+    Args:
+        inputs: torch.Tensor of shape (batch_size, vocab_size) with unnormalized logits
+        targets: torch.Tensor of shape (batch_size,) with target class indices
+        
+    Returns:
+        torch.Tensor: scalar tensor with the average cross-entropy loss
+    """
+    batch_size, vocab_size = inputs.shape
+    
+    # Compute log_softmax in a numerically stable way
+    # log_softmax(x) = x - log(sum(exp(x)))
+    #                = x - x_max - log(sum(exp(x - x_max)))
+    x_max = torch.max(inputs, dim=-1, keepdim=True).values
+    x_shifted = inputs - x_max
+    log_sum_exp = torch.log(torch.sum(torch.exp(x_shifted), dim=-1, keepdim=True))
+    log_softmax = x_shifted - log_sum_exp
+    
+    # Select the log probabilities for the target classes
+    # log_softmax has shape (batch_size, vocab_size)
+    # targets has shape (batch_size,)
+    # We want to select log_softmax[i, targets[i]] for each i
+    target_log_probs = log_softmax[torch.arange(batch_size), targets]
+    
+    # Cross-entropy loss is the negative log probability, averaged over the batch
+    cross_entropy_loss = -torch.mean(target_log_probs)
+    
+    return cross_entropy_loss
+
+def get_lr_cosine_schedule(
+    it: int,
+    max_learning_rate: float,
+    min_learning_rate: float,
+    warmup_iters: int,
+    cosine_cycle_iters: int,
+) -> float:
+    """
+    Cosine learning rate schedule with linear warmup.
+    
+    Args:
+        it: Current iteration number
+        max_learning_rate: Maximum learning rate (alpha_max)
+        min_learning_rate: Minimum learning rate (alpha_min)  
+        warmup_iters: Number of warmup iterations (T_w)
+        cosine_cycle_iters: Total iterations for the entire schedule (T_c)
+        
+    Returns:
+        Learning rate at the given iteration
+    """
+    import math
+    
+    if it <= warmup_iters:
+        # Linear warmup phase: linearly increase from 0 to max_learning_rate
+        return max_learning_rate * it / warmup_iters
+    elif it <= cosine_cycle_iters:
+        # Cosine annealing phase: cosine decay from max_learning_rate to min_learning_rate
+        # The actual cosine decay length is (cosine_cycle_iters - warmup_iters)
+        progress = (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)
+        return min_learning_rate + (max_learning_rate - min_learning_rate) * 0.5 * (1 + math.cos(math.pi * progress))
+    else:
+        # Post-annealing phase: maintain min_learning_rate
+        return min_learning_rate
+
+def gradient_clipping(parameters, max_l2_norm: float) -> None:
+    """
+    Clip gradients to have L2 norm at most max_l2_norm.
+    
+    Args:
+        parameters: Iterable of parameters with gradients to clip
+        max_l2_norm: Maximum L2 norm for the gradients
+        
+    The gradients are modified in-place.
+    """
+    import math
+    
+    eps = 1e-6  # For numerical stability
+    
+    # Collect all parameters that have gradients
+    grads = []
+    for p in parameters:
+        if p.grad is not None:
+            grads.append(p.grad)
+    
+    if not grads:
+        return  # No gradients to clip
+    
+    # Compute the L2 norm of all gradients
+    total_norm = 0.0
+    for grad in grads:
+        param_norm = grad.data.norm(dtype=torch.float32)
+        total_norm += param_norm.item() ** 2
+    total_norm = math.sqrt(total_norm)
+    
+    # If total norm exceeds max_l2_norm, scale down all gradients
+    if total_norm > max_l2_norm:
+        clip_coef = max_l2_norm / (total_norm + eps)
+        for grad in grads:
+            grad.data.mul_(clip_coef)
         
