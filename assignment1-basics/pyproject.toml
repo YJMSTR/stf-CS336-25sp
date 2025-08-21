@@ -19,6 +19,8 @@ dependencies = [
     "tqdm>=4.67.1",
     "wandb>=0.19.7",
     "jupyter>=1.1.1",
+    "matplotlib>=3.10.5",
+    "seaborn>=0.13.2",
 ]
 
 

@@ -167,3 +167,6 @@ cython_debug/
 
 .ruff_cache/
 *.zip
+
+checkpoints/
+experiment_logs/

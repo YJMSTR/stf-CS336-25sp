@@ -182,6 +182,13 @@ class RotatyPositionalEmbedding(nn.Module):
 
         cos_freqs = self.cos_freqs[token_positions]
         sin_freqs = self.sin_freqs[token_positions]
+        
+        # Add num_heads dimension for broadcasting with x_real and x_imag
+        # cos_freqs and sin_freqs have shape (..., seq_len, pairs)
+        # x_real and x_imag have shape (..., num_heads, seq_len, pairs)
+        # We need to insert a dimension at position 1 (for num_heads)
+        cos_freqs = cos_freqs.unsqueeze(-3)  # (..., 1, seq_len, pairs)
+        sin_freqs = sin_freqs.unsqueeze(-3)  # (..., 1, seq_len, pairs)
 
         rotated_real = x_real * cos_freqs - x_imag * sin_freqs
         rotated_imag = x_real * sin_freqs + x_imag * cos_freqs
@@ -226,7 +233,6 @@ def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tens
     pre_softmax = pre_softmax / (d_k ** 0.5)
 
     softmax = softmax_numerically_stable(pre_softmax, dim=-1)
-    # Verify that each column in softmax sums to 1
     softmax_sum = torch.sum(softmax, dim=-1)
     assert torch.allclose(softmax_sum, torch.ones_like(softmax_sum)), "Softmax probabilities do not sum to 1"
 
@@ -283,9 +289,11 @@ class MultiheadSelfAttention(nn.Module):
             Q = self.rope.forward(Q, self.token_positions)
             K = self.rope.forward(K, self.token_positions)
 
-        self_mask = torch.triu(torch.ones(Q.shape[0], Q.shape[2], K.shape[2], device=Q.device), diagonal=1).bool()
+        # Create causal mask with correct dimensions for multi-head attention
+        # Q.shape: [batch_size, num_heads, seq_len, d_k]
+        batch_size, num_heads, seq_len = Q.shape[0], Q.shape[1], Q.shape[2]
+        self_mask = torch.triu(torch.ones(batch_size, num_heads, seq_len, seq_len, device=Q.device), diagonal=1).bool()
         self_mask = ~self_mask
-        # print(self_mask)
 
         attention = scaled_dot_product_attention(Q, K, V, self_mask)
 
@@ -412,19 +420,15 @@ class TransformerLM(nn.Module):
         self.device = device
         self.dtype = dtype
         
-        # Token embeddings
         self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
         
-        # Transformer layers
         self.layers = nn.ModuleList([
             TransformerBlock(d_model, num_heads, d_ff, rope_theta, context_length, device=device, dtype=dtype)
             for _ in range(num_layers)
         ])
         
-        # Final layer normalization
         self.ln_final = RMSNorm(d_model, device=device, dtype=dtype)
         
-        # Language modeling head
         self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
     
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -445,14 +449,11 @@ class TransformerLM(nn.Module):
         # Token embeddings
         x = self.token_embeddings(input_ids)
         
-        # Pass through transformer blocks
         for layer in self.layers:
             x = layer(x, token_positions)
         
-        # Final layer normalization
         x = self.ln_final(x)
         
-        # Language modeling head
         logits = self.lm_head(x)
         
         return logits
@@ -535,7 +536,7 @@ def gradient_clipping(parameters, max_l2_norm: float) -> None:
     """
     import math
     
-    eps = 1e-6  # For numerical stability
+    eps = 1e-6
     
     # Collect all parameters that have gradients
     grads = []
@@ -544,16 +545,14 @@ def gradient_clipping(parameters, max_l2_norm: float) -> None:
             grads.append(p.grad)
     
     if not grads:
-        return  # No gradients to clip
+        return
     
-    # Compute the L2 norm of all gradients
     total_norm = 0.0
     for grad in grads:
         param_norm = grad.data.norm(dtype=torch.float32)
         total_norm += param_norm.item() ** 2
     total_norm = math.sqrt(total_norm)
     
-    # If total norm exceeds max_l2_norm, scale down all gradients
     if total_norm > max_l2_norm:
         clip_coef = max_l2_norm / (total_norm + eps)
         for grad in grads:
@@ -579,25 +578,23 @@ def get_batch(dataset: np.ndarray, batch_size: int, context_length: int, device:
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    # Calculate the maximum starting index we can use
-    # We need context_length tokens for input and 1 more for the target
+    # Validate that we have enough data for the requested context_length
+    if len(dataset) <= context_length:
+        raise ValueError(f"Dataset size ({len(dataset)}) must be larger than context_length ({context_length}). "
+                        f"Either use a larger dataset or reduce context_length to less than {len(dataset)}.")
+    
     max_start_idx = len(dataset) - context_length
     
-    # Sample random starting indices for each batch item
     start_indices = np.random.randint(0, max_start_idx, size=batch_size)
     
-    # Create input sequences
     input_sequences = np.zeros((batch_size, context_length), dtype=np.int64)
     target_sequences = np.zeros((batch_size, context_length), dtype=np.int64)
     
     for i in range(batch_size):
         start_idx = start_indices[i]
-        # Input sequence: x[start_idx:start_idx+context_length]
         input_sequences[i] = dataset[start_idx:start_idx + context_length]
-        # Target sequence: x[start_idx+1:start_idx+context_length+1]  
         target_sequences[i] = dataset[start_idx + 1:start_idx + context_length + 1]
     
-    # Convert to PyTorch tensors and move to the specified device
     input_tensor = torch.from_numpy(input_sequences).to(device)
     target_tensor = torch.from_numpy(target_sequences).to(device)
     
@@ -639,5 +636,124 @@ def load_checkpoint(src, model: nn.Module, optimizer: torch.optim.Optimizer) -> 
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     return checkpoint['iteration']
 
+
+def decode(
+    model: TransformerLM,
+    prompt: torch.Tensor,
+    max_new_tokens: int,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    endoftext_token_id: int = None,
+    device: str = 'cuda'
+) -> torch.Tensor:
+    """
+    Generate text from a language model using temperature scaling and top-p sampling.
+    
+    Args:
+        model: The TransformerLM model to use for generation
+        prompt: torch.Tensor of shape (batch_size, prompt_length) containing input token IDs
+        max_new_tokens: Maximum number of new tokens to generate
+        temperature: Temperature value for softmax scaling (higher = more random)
+        top_p: Cumulative probability threshold for nucleus sampling (1.0 = no filtering)
+        endoftext_token_id: Token ID for end-of-text (if None, generate max_new_tokens)
+        device: Device to run generation on
+        
+    Returns:
+        torch.Tensor of shape (batch_size, prompt_length + generated_length) with generated sequences
+    """
+    model.eval()
+    
+    if prompt.device != device:
+        prompt = prompt.to(device)
+    
+    generated = prompt.clone()
+    
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            logits = model(generated)
+            next_token_logits = logits[:, -1, :]
+            if temperature != 1.0:
+                next_token_logits = next_token_logits / temperature
+            probs = torch.softmax(next_token_logits, dim=-1)
+            if top_p < 1.0:
+                sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                sorted_indices_to_remove[:, 0] = False
+                for batch_idx in range(probs.shape[0]):
+                    indices_to_remove = sorted_indices[batch_idx][sorted_indices_to_remove[batch_idx]]
+                    probs[batch_idx, indices_to_remove] = 0
+                probs = probs / probs.sum(dim=-1, keepdim=True)
+            next_token = torch.multinomial(probs, num_samples=1)
+            generated = torch.cat([generated, next_token], dim=1)
+            if endoftext_token_id is not None:
+                if (next_token == endoftext_token_id).any():
+                    break
+    
+    model.train()
+    return generated
+
+
+def temperature_sample(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    """
+    Apply temperature scaling to logits and sample from the resulting distribution.
+    
+    # Temperature scaling is a technique to control the randomness of generation:
+    # - temperature < 1.0: Makes the distribution sharper, favoring high-probability tokens (more deterministic)
+    # - temperature = 1.0: Keeps the original distribution
+    # - temperature > 1.0: Makes the distribution flatter, increasing the chance of selecting low-probability tokens (more random)
+    
+    Args:
+        logits: torch.Tensor of shape (..., vocab_size) with unnormalized log probabilities
+        temperature: Temperature value for scaling
+        
+    Returns:
+        torch.Tensor of shape (...,) with sampled token indices
+    """
+    if temperature == 0:
+        return torch.argmax(logits, dim=-1)
+    scaled_logits = logits / temperature
+    probs = torch.softmax(scaled_logits, dim=-1)
+    return torch.multinomial(probs.view(-1, probs.shape[-1]), num_samples=1).view(logits.shape[:-1])
+
+
+def top_p_sample(logits: torch.Tensor, p: float = 0.9, temperature: float = 1.0) -> torch.Tensor:
+    """
+    Apply top-p (nucleus) sampling to logits.
+    
+    # The core idea of top-p sampling (also known as nucleus sampling) is:
+    # 1. Sort the vocabulary by probability in descending order
+    # 2. Compute the cumulative probability until it exceeds the threshold p
+    # 3. Only sample from this "nucleus" subset of tokens, ignoring the remaining low-probability tokens
+    #
+    # This method dynamically adjusts the candidate set size, preserving diversity while avoiding sampling extremely low-probability tokens.
+    
+    Args:
+        logits: torch.Tensor of shape (..., vocab_size) with unnormalized log probabilities
+        p: Cumulative probability threshold (typically 0.9-0.95)
+        temperature: Temperature value for scaling
+        
+    Returns:
+        torch.Tensor of shape (...,) with sampled token indices
+    """
+    if temperature != 1.0:
+        logits = logits / temperature
+    probs = torch.softmax(logits, dim=-1)
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+    keep_mask = cumulative_probs <= p
+    keep_mask[..., 1:] = keep_mask[..., :-1].clone()
+    keep_mask[..., 0] = True
+    filtered_probs = sorted_probs.clone()
+    filtered_probs[~keep_mask] = 0
+    filtered_probs = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True)
+    sample_indices = torch.multinomial(filtered_probs.view(-1, filtered_probs.shape[-1]), num_samples=1)
+    original_indices = torch.gather(
+        sorted_indices.view(-1, sorted_indices.shape[-1]), 
+        1, 
+        sample_indices
+    )
+    return original_indices.view(logits.shape[:-1])
 
 
