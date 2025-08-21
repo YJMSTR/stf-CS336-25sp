@@ -688,7 +688,8 @@ def decode(
             next_token = torch.multinomial(probs, num_samples=1)
             generated = torch.cat([generated, next_token], dim=1)
             if endoftext_token_id is not None:
-                if (next_token == endoftext_token_id).any():
+                # next_token shape: [batch_size, 1], so we check if any batch contains endoftext
+                if (next_token.squeeze(-1) == endoftext_token_id).any():
                     break
     
     model.train()

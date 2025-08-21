@@ -92,7 +92,8 @@ def decode_with_timing(
     temperature: float = 1.0,
     top_p: float = 1.0,
     endoftext_token_id: int = None,
-    device: str = 'cuda'
+    device: str = 'cuda',
+    tokenizer = None
 ) -> tuple[torch.Tensor, dict]:
     """
     Generate text with detailed timing measurements for prefill and decode phases.
@@ -168,9 +169,20 @@ def decode_with_timing(
             
             timing_stats['tokens_generated'] = i + 1
             
+            
             # Check for end of text token
             if endoftext_token_id is not None:
-                if (next_token == endoftext_token_id).any():
+                next_token_id = next_token.item()
+                if next_token_id == endoftext_token_id:
+                    print(f"Found <|endoftext|> token at step {i}, stopping generation")
+                    break
+            
+            # Fallback: Check if decoded text contains endoftext patterns
+            if tokenizer and i % 5 == 0:  # Check every 5 steps
+                current_generated = generated[0, prompt_length:].tolist()
+                current_text = tokenizer.decode(current_generated)
+                if '<|endoftext|>' in current_text:
+                    print(f"Found <|endoftext|> in text at step {i}, stopping generation")
                     break
     
     total_end_time = time.time()
@@ -201,15 +213,32 @@ def generate_text(
         print("Warning: Could not tokenize prompt, using default tokens")
         prompt_tokens = [0]  # Use first token as fallback
     
-    # Convert to tensor
     prompt_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
     
-    # Get endoftext token ID - try different possible formats
+    # Get endoftext token ID based on BPE tokenizer implementation
     endoftext_id = None
     if hasattr(tokenizer, 'token_to_id'):
-        endoftext_id = tokenizer.token_to_id.get('<|endoftext|>', None)
-        if endoftext_id is None:
-            endoftext_id = tokenizer.token_to_id.get(b'<|endoftext|>', None)
+        # In BPE tokenizer, special tokens are stored as UTF-8 encoded bytes
+        endoftext_bytes = '<|endoftext|>'.encode('utf-8')
+        endoftext_id = tokenizer.token_to_id.get(endoftext_bytes, None)
+    
+    # Fallback: search through vocab directly
+    if endoftext_id is None and hasattr(tokenizer, 'vocab'):
+        endoftext_bytes = b'<|endoftext|>'
+        for token_id, token_bytes in tokenizer.vocab.items():
+            if token_bytes == endoftext_bytes:
+                endoftext_id = token_id
+                break
+    
+    print(f"Endoftext token ID: {endoftext_id}")
+    
+    # Verify endoftext token encoding works correctly
+    if endoftext_id is not None:
+        test_tokens = tokenizer.encode("<|endoftext|>")
+        if endoftext_id in test_tokens:
+            print(f"✓ Tokenizer correctly encodes <|endoftext|> as ID {endoftext_id}")
+        else:
+            print(f"⚠️ Warning: <|endoftext|> not encoded as expected ID {endoftext_id}")
     
     print(f"\nPrompt: '{prompt}'")
     print(f"Prompt tokens ({len(prompt_tokens)}): {prompt_tokens[:20]}...")
@@ -223,7 +252,8 @@ def generate_text(
         temperature=temperature,
         top_p=top_p,
         endoftext_token_id=endoftext_id,
-        device=device
+        device=device,
+        tokenizer=tokenizer
     )
     
     # Extract generated tokens (excluding prompt)
@@ -233,7 +263,20 @@ def generate_text(
     generated_text = tokenizer.decode(generated_tokens)
     
     print(f"\nGenerated {len(generated_tokens)} new tokens")
+    print(f"Generated token IDs: {generated_tokens[:20]}{'...' if len(generated_tokens) > 20 else ''}")
     print(f"Generated text: '{generated_text}'")
+    
+    # Check if endoftext token was actually generated
+    if endoftext_id is not None and endoftext_id in generated_tokens:
+        endoftext_pos = generated_tokens.index(endoftext_id)
+        print(f"✓ <|endoftext|> token (ID: {endoftext_id}) found at position {endoftext_pos}")
+    elif endoftext_id is not None:
+        if '<|endoftext|>' in generated_text:
+            print(f"ℹ️  Stopping detected via text pattern (not exact token ID {endoftext_id})")
+        else:
+            print(f"ℹ️  No <|endoftext|> detected - generated {len(generated_tokens)} tokens")
+    else:
+        print("⚠️  Could not determine endoftext token ID")
     
     # Display timing statistics
     print(f"\nPerformance Statistics:")
@@ -260,7 +303,7 @@ def main():
                         help='Path to merges file (for separate vocab/merges BPE files)')
     parser.add_argument('--prompt', type=str, default="Once upon a time",
                         help='Text prompt for generation')
-    parser.add_argument('--max_tokens', type=int, default=128,
+    parser.add_argument('--max_tokens', type=int, default=384,
                         help='Maximum number of tokens to generate')
     parser.add_argument('--temperature', type=float, default=0.8,
                         help='Temperature for sampling (0.1-2.0 typical)')
@@ -287,11 +330,22 @@ def main():
     
     print(f"Vocabulary size: {vocab_size}")
     
+    # Quick check if endoftext token exists in tokenizer
+    endoftext_bytes = b'<|endoftext|>'
+    endoftext_in_vocab = any(token_bytes == endoftext_bytes for token_bytes in tokenizer.vocab.values())
+    
+    if endoftext_in_vocab:
+        endoftext_token_id = next(token_id for token_id, token_bytes in tokenizer.vocab.items() 
+                                 if token_bytes == endoftext_bytes)
+        print(f"Found <|endoftext|> in vocab at ID {endoftext_token_id}")
+    else:
+        print("WARNING: <|endoftext|> token not found in vocabulary!")
+    
     # Initialize model (you need to match these parameters with your trained model)
     # These are example values - adjust based on your model configuration
     model_config = {
         'vocab_size': vocab_size,
-        'context_length': 256,
+        'context_length': 512,
         'd_model': 512,
         'num_layers': 4,
         'num_heads': 16,
@@ -305,6 +359,14 @@ def main():
         print(f"  {k}: {v}")
     
     model = TransformerLM(**model_config)
+    
+    # Check model vocab size vs endoftext token ID
+    if endoftext_in_vocab:
+        if endoftext_token_id >= model_config['vocab_size']:
+            print(f"ERROR: <|endoftext|> token ID ({endoftext_token_id}) >= model vocab_size ({model_config['vocab_size']})")
+            print(f"Model cannot generate this token! Consider adjusting model vocab_size.")
+        else:
+            print(f"✓ <|endoftext|> token ID ({endoftext_token_id}) < model vocab_size ({model_config['vocab_size']})")
     
     # Load checkpoint
     print(f"\nLoading checkpoint from {args.checkpoint}...")

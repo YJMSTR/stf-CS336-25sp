@@ -138,12 +138,14 @@ def load_tokenizer(args):
             with open(args.merges_file, 'rb') as f:
                 merges = pickle.load(f)
             
-            tokenizer = BPE_Tokenizer(vocab, merges)
-            print(f"  ✓ Loaded tokenizer with {len(vocab)} vocab size")
+            # Include special tokens to ensure proper handling
+            special_tokens = ['<|endoftext|>']
+            tokenizer = BPE_Tokenizer(vocab, merges, special_tokens)
+            print(f"  Loaded tokenizer with {len(vocab)} vocab size and special tokens: {special_tokens}")
             return tokenizer
             
         except Exception as e:
-            print(f"  ✗ Failed to load from pickle files: {e}")
+            print(f"  Failed to load from pickle files: {e}")
     
     # Try to load from JSON/text files if provided
     if args.vocab_json and args.merges_txt:
@@ -169,12 +171,14 @@ def load_tokenizer(args):
                     if len(parts) >= 2:
                         merges.append((parts[0].encode('utf-8'), parts[1].encode('utf-8')))
             
-            tokenizer = BPE_Tokenizer(vocab, merges)
-            print(f"  ✓ Loaded tokenizer with {len(vocab)} vocab size")
+            # Include special tokens to ensure proper handling
+            special_tokens = ['<|endoftext|>']
+            tokenizer = BPE_Tokenizer(vocab, merges, special_tokens)
+            print(f"  Loaded tokenizer with {len(vocab)} vocab size and special tokens: {special_tokens}")
             return tokenizer
             
         except Exception as e:
-            print(f"  ✗ Failed to load from JSON/text files: {e}")
+            print(f"  Failed to load from JSON/text files: {e}")
     
     return None
 
