@@ -21,3 +21,23 @@ uv run python train.py \
 
 uv run python generate_text_example.py --checkpoint checkpoints/tinystories_bs_32_ctx_512/checkpoint_final.pt --tokenizer cs336_basics/tinystories_vocab.pkl --merges cs336_basics/tinystories_merges.pkl --prompt 'the little girl'
 ```
+
+for openwebtext
+```
+uv run python prepare_data.py --train_input data/owt_train.txt --val_input data/owt_valid.txt --train_output data/owt_train.npy --val_output data/owt_valid.npy --output_dir data
+
+uv run python train.py \
+    --train_data data/owt_train.npy \
+    --val_data data/owt_valid.npy \
+    --vocab_size 10000 \
+    --context_length 256 \
+    --d_model 512 \
+    --num_layers 4 \
+    --num_heads 16 \
+    --d_ff 1344 \
+    --rope_theta 10000 \
+    --batch_size 32 \
+    --max_iters 500 --warmup_iters 100 \
+    --learning_rate 1e-3 \
+    --checkpoint_dir checkpoints/owt_bs_32_ctx_512
+```

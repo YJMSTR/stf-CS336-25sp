@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """
 Script to prepare TinyStories sample data for training.
-Converts text file to tokenized numpy arrays for training and validation.
+Converts text file(s) to tokenized numpy arrays for training and validation.
+
+Usage:
+1. Single file mode (split into train/val):
+   python prepare_data.py --input_file data.txt --train_ratio 0.9
+
+2. Separate files mode:
+   python prepare_data.py --train_input train.txt --val_input val.txt
+
+Both modes support custom output paths and tokenizer files.
 """
 
 import os
@@ -22,8 +31,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Prepare text data for Transformer training')
     
     # Input/Output files
-    parser.add_argument('--input_file', type=str, default="tests/fixtures/tinystories_sample_5M.txt",
-                        help='Input text file to tokenize')
+    parser.add_argument('--input_file', type=str, default=None,
+                        help='Single input text file to tokenize and split (for backward compatibility)')
+    parser.add_argument('--train_input', type=str, default=None,
+                        help='Training text file to tokenize')
+    parser.add_argument('--val_input', type=str, default=None,
+                        help='Validation text file to tokenize')
     parser.add_argument('--train_output', type=str, default="data/tinystories_sample_5M_train.npy",
                         help='Output file for training data')
     parser.add_argument('--val_output', type=str, default="data/tinystories_sample_5M_val.npy",
@@ -186,9 +199,32 @@ def load_tokenizer(args):
 def main():
     args = parse_args()
     
-    # Validate input file exists
-    if not os.path.exists(args.input_file):
-        print(f"ERROR: Input file does not exist: {args.input_file}")
+    # Validate input arguments
+    if args.train_input and args.val_input:
+        # Separate train/val files mode
+        mode = "separate"
+        if not os.path.exists(args.train_input):
+            print(f"ERROR: Training input file does not exist: {args.train_input}")
+            sys.exit(1)
+        if not os.path.exists(args.val_input):
+            print(f"ERROR: Validation input file does not exist: {args.val_input}")
+            sys.exit(1)
+        print(f"Using separate train/validation files:")
+        print(f"  Training file: {args.train_input}")
+        print(f"  Validation file: {args.val_input}")
+    elif args.input_file:
+        # Single file mode (backward compatibility)
+        mode = "single"
+        if not os.path.exists(args.input_file):
+            print(f"ERROR: Input file does not exist: {args.input_file}")
+            sys.exit(1)
+        print(f"Using single file with train/val split:")
+        print(f"  Input file: {args.input_file}")
+        print(f"  Train/Val ratio: {args.train_ratio:.1f}/{1-args.train_ratio:.1f}")
+    else:
+        print("\nERROR: Must provide either:")
+        print("  - Single file: --input_file <file>")
+        print("  - Separate files: --train_input <train_file> --val_input <val_file>")
         sys.exit(1)
     
     # Load tokenizer
@@ -204,28 +240,44 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Create temporary file for full tokenized data
-    temp_tokens_file = os.path.join(args.output_dir, "temp_tokens.npy")
-    
-    print(f"\nEncoding text file: {args.input_file}")
-    token_array = encode_text_file(args.input_file, tokenizer, temp_tokens_file, args.chunk_size)
-    
-    # Split data
-    train_tokens, val_tokens = split_data(token_array, train_ratio=args.train_ratio)
-    
-    # Save train and validation data
-    np.save(args.train_output, train_tokens)
-    np.save(args.val_output, val_tokens)
-    
-    # Clean up temporary file
-    if os.path.exists(temp_tokens_file):
-        os.remove(temp_tokens_file)
-    
-    print(f"\nData preparation complete!")
-    print(f"  Input file: {args.input_file}")
-    print(f"  Training data: {args.train_output} ({len(train_tokens):,} tokens)")
-    print(f"  Validation data: {args.val_output} ({len(val_tokens):,} tokens)")
-    print(f"  Train/Val ratio: {args.train_ratio:.1f}/{1-args.train_ratio:.1f}")
+    if mode == "separate":
+        # Process train and validation files separately
+        print(f"\nProcessing training file...")
+        train_tokens = encode_text_file(args.train_input, tokenizer, args.train_output, args.chunk_size)
+        
+        print(f"\nProcessing validation file...")
+        val_tokens = encode_text_file(args.val_input, tokenizer, args.val_output, args.chunk_size)
+        
+        print(f"\nData preparation complete!")
+        print(f"  Training file: {args.train_input}")
+        print(f"  Validation file: {args.val_input}")
+        print(f"  Training data: {args.train_output} ({len(train_tokens):,} tokens)")
+        print(f"  Validation data: {args.val_output} ({len(val_tokens):,} tokens)")
+        
+    else:
+        # Single file mode - encode and split
+        # Create temporary file for full tokenized data
+        temp_tokens_file = os.path.join(args.output_dir, "temp_tokens.npy")
+        
+        print(f"\nEncoding text file: {args.input_file}")
+        token_array = encode_text_file(args.input_file, tokenizer, temp_tokens_file, args.chunk_size)
+        
+        # Split data
+        train_tokens, val_tokens = split_data(token_array, train_ratio=args.train_ratio)
+        
+        # Save train and validation data
+        np.save(args.train_output, train_tokens)
+        np.save(args.val_output, val_tokens)
+        
+        # Clean up temporary file
+        if os.path.exists(temp_tokens_file):
+            os.remove(temp_tokens_file)
+        
+        print(f"\nData preparation complete!")
+        print(f"  Input file: {args.input_file}")
+        print(f"  Training data: {args.train_output} ({len(train_tokens):,} tokens)")
+        print(f"  Validation data: {args.val_output} ({len(val_tokens):,} tokens)")
+        print(f"  Train/Val ratio: {args.train_ratio:.1f}/{1-args.train_ratio:.1f}")
     
     print(f"\nTo train with this data, run:")
     print(f"  python train.py \\")
